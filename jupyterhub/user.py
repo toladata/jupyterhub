@@ -173,7 +173,7 @@ class User(HasTraits):
     
     @property
     def host(self):
-        """Get the *host* for my server (domain[:port])"""
+        """Get the *host* for my server (proto://domain[:port])"""
         # FIXME: escaped_name probably isn't escaped enough in general for a domain fragment
         parsed = urlparse(self.settings['subdomain_host'])
         h = '%s://%s.%s' % (parsed.scheme, self.escaped_name, parsed.netloc)
@@ -225,7 +225,14 @@ class User(HasTraits):
             f = spawner.start()
             # commit any changes in spawner.start (always commit db changes before yield)
             db.commit()
-            yield gen.with_timeout(timedelta(seconds=spawner.start_timeout), f)
+            ip_port = yield gen.with_timeout(timedelta(seconds=spawner.start_timeout), f)
+            if ip_port:
+                # get ip, port info from return value of start()
+                self.server.ip, self.server.port = ip_port
+            else:
+                # prior to 0.7, spawners had to store this info in user.server themselves.
+                # Handle < 0.7 behavior with a warning, assuming info was stored in db by the Spawner.
+                self.log.warning("DEPRECATION: Spawner.start should return (ip, port) in JupyterHub >= 0.7")
         except Exception as e:
             if isinstance(e, gen.TimeoutError):
                 self.log.warning("{user}'s server failed to start in {s} seconds, giving up".format(
@@ -291,12 +298,20 @@ class User(HasTraits):
         self.spawner.stop_polling()
         self.stop_pending = True
         try:
+            api_token = self.spawner.api_token
             status = yield spawner.poll()
             if status is None:
                 yield self.spawner.stop()
             spawner.clear_state()
             self.state = spawner.get_state()
             self.last_activity = datetime.utcnow()
+            # cleanup server entry, API token from defunct server
+            if self.server:
+                # cleanup server entry from db
+                self.db.delete(self.server)
+            orm_token = orm.APIToken.find(self.db, api_token)
+            if orm_token:
+                self.db.delete(orm_token)
             self.server = None
             self.db.commit()
         finally:

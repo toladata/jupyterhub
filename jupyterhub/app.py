@@ -13,7 +13,6 @@ import socket
 import sys
 import threading
 from datetime import datetime
-from distutils.version import LooseVersion as V
 from getpass import getuser
 from subprocess import Popen
 from urllib.parse import urlparse
@@ -45,8 +44,9 @@ here = os.path.dirname(__file__)
 import jupyterhub
 from . import handlers, apihandlers
 from .handlers.static import CacheControlStaticFilesHandler, LogoHandler
+from .services.service import Service
 
-from . import orm
+from . import dbutil, orm
 from .user import User, UserDict
 from ._data import DATA_FILES_PATH
 from .log import CoroutineLogFormatter, log_request
@@ -103,6 +103,7 @@ SECRET_BYTES = 2048 # the number of bytes to use when generating new secrets
 class NewToken(Application):
     """Generate and print a new API token"""
     name = 'jupyterhub-token'
+    version = jupyterhub.__version__
     description = """Generate and return new API token for a user.
 
     Usage:
@@ -142,6 +143,26 @@ class NewToken(Application):
         token = user.new_api_token()
         print(token)
 
+class UpgradeDB(Application):
+    """Upgrade the JupyterHub database schema."""
+    
+    name = 'jupyterhub-upgrade-db'
+    version = jupyterhub.__version__
+    description = """Upgrade the JupyterHub database to the current schema.
+    
+    Usage:
+
+        jupyterhub upgrade-db
+    """
+    aliases = common_aliases
+    classes = []
+    
+    def start(self):
+        hub = JupyterHub(parent=self)
+        hub.load_config_file(hub.config_file)
+        self.log.info("Upgrading %s", hub.db_url)
+        dbutil.upgrade(hub.db_url)
+
 
 class JupyterHub(Application):
     """An Application for starting a Multi-User Jupyter Notebook server."""
@@ -170,7 +191,8 @@ class JupyterHub(Application):
     flags = Dict(flags)
 
     subcommands = {
-        'token': (NewToken, "Generate an API token for a user")
+        'token': (NewToken, "Generate an API token for a user"),
+        'upgrade-db': (UpgradeDB, "Upgrade your JupyterHub state database to the current version."),
     }
 
     classes = List([
@@ -179,6 +201,17 @@ class JupyterHub(Application):
         Authenticator,
         PAMAuthenticator,
     ])
+    
+    load_groups = Dict(List(Unicode()),
+        help="""Dict of 'group': ['usernames'] to load at startup.
+        
+        This strictly *adds* groups and users to groups.
+        
+        Loading one set of groups, then starting JupyterHub again with a different
+        set will not remove users or groups from previous launches.
+        That must be done through the API.
+        """
+    ).tag(config=True)
 
     config_file = Unicode('jupyterhub_config.py',
         help="The config file to load",
@@ -259,6 +292,15 @@ class JupyterHub(Application):
             # if not specified, assume https: You have to be really explicit about HTTP!
             self.subdomain_host = 'https://' + new
 
+    domain = Unicode(
+        help="domain name, e.g. 'example.com' (excludes protocol, port)"
+    )
+    @default('domain')
+    def _domain_default(self):
+        if not self.subdomain_host:
+            return ''
+        return urlparse(self.subdomain_host).hostname
+
     port = Integer(8000,
         help="The public facing port of the proxy"
     ).tag(config=True)
@@ -324,19 +366,18 @@ class JupyterHub(Application):
         help="The ip for this process"
     ).tag(config=True)
     hub_prefix = URLPrefix('/hub/',
-        help="The prefix for the hub server. Must not be '/'"
-    ).tag(config=True)
+        help="The prefix for the hub server.  Always /base_url/hub/"
+    )
 
     @default('hub_prefix')
     def _hub_prefix_default(self):
         return url_path_join(self.base_url, '/hub/')
 
-    @observe('hub_prefix')
-    def _hub_prefix_changed(self, name, old, new):
-        if new == '/':
-            raise TraitError("'/' is not a valid hub prefix")
-        if not new.startswith(self.base_url):
-            self.hub_prefix = url_path_join(self.base_url, new)
+    @observe('base_url')
+    def _update_hub_prefix(self, change):
+        """add base URL to hub prefix"""
+        base_url = change['new']
+        self.hub_prefix = self._hub_prefix_default()
 
     cookie_secret = Bytes(
         help="""The cookie secret to use to encrypt cookies.
@@ -353,11 +394,53 @@ class JupyterHub(Application):
     ).tag(config=True)
 
     api_tokens = Dict(Unicode(),
-        help="""Dict of token:username to be loaded into the database.
+        help="""PENDING DEPRECATION: consider using service_tokens
+        
+        Dict of token:username to be loaded into the database.
 
-        Allows ahead-of-time generation of API tokens for use by services.
+        Allows ahead-of-time generation of API tokens for use by externally managed services,
+        which authenticate as JupyterHub users.
+
+        Consider using service_tokens for general services that talk to the JupyterHub API.
         """
     ).tag(config=True)
+    @observe('api_tokens')
+    def _deprecate_api_tokens(self, change):
+        self.log.warn("JupyterHub.api_tokens is pending deprecation."
+            "  Consider using JupyterHub.service_tokens."
+            "  If you have a use case for services that identify as users,"
+            " let us know: https://github.com/jupyterhub/jupyterhub/issues"
+        )
+
+    service_tokens = Dict(Unicode(),
+        help="""Dict of token:servicename to be loaded into the database.
+
+        Allows ahead-of-time generation of API tokens for use by externally managed services.
+        """
+    ).tag(config=True)
+    
+    services = List(Dict(),
+        help="""List of service specification dictionaries.
+        
+        A service
+        
+        For instance::
+        
+            services = [
+                {
+                    'name': 'cull_idle',
+                    'command': ['/path/to/cull_idle_servers.py'],
+                },
+                {
+                    'name': 'formgrader',
+                    'url': 'http://127.0.0.1:1234',
+                    'token': 'super-secret',
+                    'env': 
+                }
+            ]
+        """
+    ).tag(config=True)
+    _service_map = Dict()
 
     authenticator_class = Type(PAMAuthenticator, Authenticator,
         help="""Class for authenticating users.
@@ -706,6 +789,11 @@ class JupyterHub(Application):
             self.log.debug("Database error was:", exc_info=True)
             if self.db_url.startswith('sqlite:///'):
                 self._check_db_path(self.db_url.split(':///', 1)[1])
+            self.log.critical('\n'.join([
+                "If you recently upgraded JupyterHub, try running",
+                "    jupyterhub upgrade-db",
+                "to upgrade your JupyterHub database schema",
+            ]))
             self.exit(1)
 
     def init_hub(self):
@@ -800,44 +888,153 @@ class JupyterHub(Application):
         # but changes to the whitelist can occur in the database,
         # and persist across sessions.
         for user in db.query(orm.User):
-            yield gen.maybe_future(self.authenticator.add_user(user))
+            try:
+                yield gen.maybe_future(self.authenticator.add_user(user))
+            except Exception:
+                # TODO: Review approach to synchronize whitelist with db
+                # known cause of the exception is a user who has already been removed from the system
+                # but the user still exists in the hub's user db
+                self.log.exception("Error adding user %r already in db", user.name)
         db.commit() # can add_user touch the db?
 
         # The whitelist set and the users in the db are now the same.
         # From this point on, any user changes should be done simultaneously
         # to the whitelist set and user db, unless the whitelist is empty (all users allowed).
-
-    def init_api_tokens(self):
-        """Load predefined API tokens (for services) into database"""
+    
+    def init_groups(self):
+        """Load predefined groups into the database"""
         db = self.db
-        for token, username in self.api_tokens.items():
-            username = self.authenticator.normalize_username(username)
-            if not self.authenticator.check_whitelist(username):
-                raise ValueError("Token username %r is not in whitelist" % username)
-            if not self.authenticator.validate_username(username):
-                raise ValueError("Token username %r is not valid" % username)
-            orm_token = orm.APIToken.find(db, token)
-            if orm_token is None:
-                user = orm.User.find(db, username)
-                user_created = False
+        for name, usernames in self.load_groups.items():
+            group = orm.Group.find(db, name)
+            if group is None:
+                group = orm.Group(name=name)
+                db.add(group)
+            for username in usernames:
+                username = self.authenticator.normalize_username(username)
+                if not self.authenticator.check_whitelist(username):
+                    raise ValueError("Username %r is not in whitelist" % username)
+                user = orm.User.find(db, name=username)
                 if user is None:
-                    user_created = True
-                    self.log.debug("Adding user %r to database", username)
+                    if not self.authenticator.validate_username(username):
+                        raise ValueError("Group username %r is not valid" % username)
                     user = orm.User(name=username)
                     db.add(user)
+                group.users.append(user)
+        db.commit()
+    
+    def _add_tokens(self, token_dict, kind):
+        """Add tokens for users or services to the database"""
+        if kind == 'user':
+            Class = orm.User
+        elif kind == 'service':
+            Class = orm.Service
+        else:
+            raise ValueError("kind must be user or service, not %r" % kind)
+
+        db = self.db
+        for token, name in token_dict.items():
+            if kind == 'user':
+                name = self.authenticator.normalize_username(name)
+                if not self.authenticator.check_whitelist(name):
+                    raise ValueError("Token name %r is not in whitelist" % name)
+                if not self.authenticator.validate_username(name):
+                    raise ValueError("Token name %r is not valid" % name)
+            orm_token = orm.APIToken.find(db, token)
+            if orm_token is None:
+                obj = Class.find(db, name)
+                created = False
+                if obj is None:
+                    created = True
+                    self.log.debug("Adding %s %r to database", kind, name)
+                    obj = Class(name=name)
+                    db.add(obj)
                     db.commit()
-                self.log.info("Adding API token for %s", username)
+                self.log.info("Adding API token for %s: %s", kind, name)
                 try:
-                    user.new_api_token(token)
+                    obj.new_api_token(token)
                 except Exception:
-                    if user_created:
+                    if created:
                         # don't allow bad tokens to create users
-                        db.delete(user)
+                        db.delete(obj)
                         db.commit()
                         raise
             else:
                 self.log.debug("Not duplicating token %s", orm_token)
         db.commit()
+
+    def init_api_tokens(self):
+        """Load predefined API tokens (for services) into database"""
+        self._add_tokens(self.service_tokens, kind='service')
+        self._add_tokens(self.api_tokens, kind='user')
+    
+    def init_services(self):
+        self._service_map.clear()
+        if self.domain:
+            domain = 'services.' + self.domain
+            parsed = urlparse(self.subdomain_host)
+            host = '%s://services.%s' % (parsed.scheme, parsed.netloc)
+        else:
+            domain = host = ''
+        for spec in self.services:
+            if 'name' not in spec:
+                raise ValueError('service spec must have a name: %r' % spec)
+            name = spec['name']
+            # get/create orm
+            orm_service = orm.Service.find(self.db, name=name)
+            if orm_service is None:
+                # not found, create a new one
+                orm_service = orm.Service(name=name)
+                self.db.add(orm_service)
+            orm_service.admin = spec.get('admin', False)
+            self.db.commit()
+            service = Service(parent=self,
+                base_url=self.base_url,
+                db=self.db, orm=orm_service,
+                domain=domain, host=host,
+                hub_api_url=self.hub.api_url,
+            )
+
+            traits = service.traits(input=True)
+            for key, value in spec.items():
+                if key not in traits:
+                    raise AttributeError("No such service field: %s" % key)
+                setattr(service, key, value)
+
+            if service.url:
+                parsed = urlparse(service.url)
+                if parsed.port is not None:
+                    port = parsed.port
+                elif parsed.scheme == 'http':
+                    port = 80
+                elif parsed.scheme == 'https':
+                    port = 443
+                server = service.orm.server = orm.Server(
+                    proto=parsed.scheme,
+                    ip=parsed.hostname,
+                    port=port,
+                    cookie_name='jupyterhub-services',
+                    base_url=service.prefix,
+                )
+                self.db.add(server)
+            else:
+                service.orm.server = None
+
+            self._service_map[name] = service
+            if service.managed:
+                if not service.api_token:
+                    # generate new token
+                    service.api_token = service.orm.new_api_token()
+                else:
+                    # ensure provided token is registered
+                    self.service_tokens[service.api_token] = service.name
+            else:
+                self.service_tokens[service.api_token] = service.name
+
+        # delete services from db not in service config:
+        for service in self.db.query(orm.Service):
+            if service.name not in self._service_map:
+                self.db.delete(service)
+        self.db.commit()
 
     @gen.coroutine
     def init_spawners(self):
@@ -902,6 +1099,7 @@ class JupyterHub(Application):
         self.proxy.log = self.log
         self.proxy.public_server.ip = self.ip
         self.proxy.public_server.port = self.port
+        self.proxy.public_server.base_url = self.base_url
         self.proxy.api_server.ip = self.proxy_api_ip
         self.proxy.api_server.port = self.proxy_api_port
         self.proxy.api_server.base_url = '/api/routes/'
@@ -960,7 +1158,7 @@ class JupyterHub(Application):
                     " There better be SSL termination happening somewhere else...")
             else:
                 self.log.error(
-                    "Refusing to run JuptyterHub without SSL."
+                    "Refusing to run JupyterHub without SSL."
                     " If you are terminating SSL in another layer,"
                     " pass --no-ssl to tell JupyterHub to allow the proxy to listen on HTTP."
                 )
@@ -968,7 +1166,7 @@ class JupyterHub(Application):
         self.log.info("Starting proxy @ %s", self.proxy.public_server.bind_url)
         self.log.debug("Proxy cmd: %s", cmd)
         try:
-            self.proxy_process = Popen(cmd, env=env)
+            self.proxy_process = Popen(cmd, env=env, start_new_session=True)
         except FileNotFoundError as e:
             self.log.error(
                 "Failed to find proxy %r\n"
@@ -1006,6 +1204,7 @@ class JupyterHub(Application):
         yield self.start_proxy()
         self.log.info("Setting up routes on new proxy")
         yield self.proxy.add_all_users(self.users)
+        yield self.proxy.add_all_services(self.services)
         self.log.info("New proxy back up, and good to go")
 
     def init_tornado_settings(self):
@@ -1031,8 +1230,6 @@ class JupyterHub(Application):
         else:
             version_hash=datetime.now().strftime("%Y%m%d%H%M%S"),
 
-        subdomain_host = self.subdomain_host
-        domain = urlparse(subdomain_host).hostname
         settings = dict(
             log_function=log_request,
             config=self.config,
@@ -1055,8 +1252,8 @@ class JupyterHub(Application):
             template_path=self.template_paths,
             jinja2_env=jinja_env,
             version_hash=version_hash,
-            subdomain_host=subdomain_host,
-            domain=domain,
+            subdomain_host=self.subdomain_host,
+            domain=self.domain,
             statsd=self.statsd,
         )
         # allow configured settings to have priority
@@ -1064,6 +1261,7 @@ class JupyterHub(Application):
         self.tornado_settings = settings
         # constructing users requires access to tornado_settings
         self.tornado_settings['users'] = self.users
+        self.tornado_settings['services'] = self._service_map
 
     def init_tornado_application(self):
         """Instantiate the tornado Application object"""
@@ -1100,6 +1298,8 @@ class JupyterHub(Application):
         self.init_hub()
         self.init_proxy()
         yield self.init_users()
+        self.init_groups()
+        self.init_services()
         self.init_api_tokens()
         self.init_tornado_settings()
         yield self.init_spawners()
@@ -1203,7 +1403,7 @@ class JupyterHub(Application):
         self.statsd.gauge('users.active', active_users_count)
 
         self.db.commit()
-        yield self.proxy.check_routes(self.users, routes)
+        yield self.proxy.check_routes(self.users, self._service_map, routes)
 
     @gen.coroutine
     def start(self):
@@ -1236,9 +1436,16 @@ class JupyterHub(Application):
         except Exception as e:
             self.log.critical("Failed to start proxy", exc_info=True)
             self.exit(1)
-            return
+        
+        for service_name, service in self._service_map.items():
+            try:
+                yield service.start()
+            except Exception as e:
+                self.log.critical("Failed to start service %s", service_name, exc_info=True)
+                self.exit(1)
 
         loop.add_callback(self.proxy.add_all_users, self.users)
+        loop.add_callback(self.proxy.add_all_services, self._service_map)
 
         if self.proxy_process:
             # only check / restart the proxy if we started it in the first place.
@@ -1307,6 +1514,7 @@ class JupyterHub(Application):
             print("\nInterrupted")
 
 NewToken.classes.append(JupyterHub)
+UpgradeDB.classes.append(JupyterHub)
 
 main = JupyterHub.launch_instance
 

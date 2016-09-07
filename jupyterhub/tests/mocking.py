@@ -19,7 +19,8 @@ from ..app import JupyterHub
 from ..auth import PAMAuthenticator
 from .. import orm
 from ..spawner import LocalProcessSpawner
-from ..utils import url_path_join
+from ..singleuser import SingleUserNotebookApp
+from ..utils import random_port
 
 from pamela import PAMError
 
@@ -36,7 +37,11 @@ def mock_open_session(username, service):
 
 
 class MockSpawner(LocalProcessSpawner):
+    """Base mock spawner
     
+    - disables user-switching that we need root permissions to do
+    - spawns jupyterhub.tests.mocksu instead of a full single-user server
+    """
     def make_preexec_fn(self, *a, **kw):
         # skip the setuid stuff
         return
@@ -46,6 +51,7 @@ class MockSpawner(LocalProcessSpawner):
     
     def user_env(self, env):
         return env
+
     @default('cmd')
     def _cmd_default(self):
         return [sys.executable, '-m', 'jupyterhub.tests.mocksu']
@@ -56,8 +62,9 @@ class SlowSpawner(MockSpawner):
     
     @gen.coroutine
     def start(self):
-        yield super().start()
+        (ip, port) = yield super().start()
         yield gen.sleep(2)
+        return ip, port
     
     @gen.coroutine
     def stop(self):
@@ -78,6 +85,7 @@ class NeverSpawner(MockSpawner):
 
 
 class FormSpawner(MockSpawner):
+    """A spawner that has an options form defined"""
     options_form = "IMAFORM"
     
     def options_from_form(self, form_data):
@@ -109,6 +117,7 @@ class MockPAMAuthenticator(PAMAuthenticator):
                 ):
             return super(MockPAMAuthenticator, self).authenticate(*args, **kwargs)
 
+
 class MockHub(JupyterHub):
     """Hub with various mock bits"""
 
@@ -116,6 +125,8 @@ class MockHub(JupyterHub):
     confirm_no_ssl = True
     
     last_activity_interval = 2
+    
+    base_url = '/@/space%20word/'
     
     @default('subdomain_host')
     def _subdomain_host_default(self):
@@ -176,6 +187,7 @@ class MockHub(JupyterHub):
         self.db_file.close()
     
     def login_user(self, name):
+        """Login a user by name, returning her cookies."""
         base_url = public_url(self)
         r = requests.post(base_url + 'hub/login',
             data={
@@ -190,19 +202,75 @@ class MockHub(JupyterHub):
 
 
 def public_host(app):
+    """Return the public *host* (no URL prefix) of the given JupyterHub instance."""
     if app.subdomain_host:
         return app.subdomain_host
     else:
         return app.proxy.public_server.host
 
 
-def public_url(app):
-    return public_host(app) + app.proxy.public_server.base_url
-
-
-def user_url(user, app):
-    if app.subdomain_host:
-        host = user.host
+def public_url(app, user_or_service=None):
+    """Return the full, public base URL (including prefix) of the given JupyterHub instance."""
+    if user_or_service:
+        if app.subdomain_host:
+            host = user_or_service.host
+        else:
+            host = public_host(app)
+        return host + user_or_service.server.base_url
     else:
-        host = public_host(app)
-    return host + user.server.base_url
+        return public_host(app) + app.proxy.public_server.base_url
+
+
+# single-user-server mocking:
+
+class MockSingleUserServer(SingleUserNotebookApp):
+    """Mock-out problematic parts of single-user server when run in a thread
+    
+    Currently:
+    
+    - disable signal handler
+    """
+
+    def init_signal(self):
+        pass
+
+
+class TestSingleUserSpawner(MockSpawner):
+    """Spawner that starts a MockSingleUserServer in a thread."""
+    _thread = None
+    @gen.coroutine
+    def start(self):
+        self.user.server.port = random_port()
+        env = self.get_env()
+        args = self.get_args()
+        evt = threading.Event()
+        print(args, env)
+        def _run():
+            io_loop = IOLoop()
+            io_loop.make_current()
+            io_loop.add_callback(lambda : evt.set())
+            
+            with mock.patch.dict(os.environ, env):
+                app = self._app = MockSingleUserServer()
+                app.initialize(args)
+                app.start()
+        
+        self._thread = threading.Thread(target=_run)
+        self._thread.start()
+        ready = evt.wait(timeout=3)
+        assert ready
+    
+    @gen.coroutine
+    def stop(self):
+        self._app.stop()
+        self._thread.join()
+    
+    @gen.coroutine
+    def poll(self):
+        if self._thread is None:
+            return 0
+        if self._thread.is_alive():
+            return None
+        else:
+            return 0
+

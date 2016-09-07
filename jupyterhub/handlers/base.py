@@ -68,6 +68,9 @@ class BaseHandler(RequestHandler):
         return self.settings.setdefault('users', {})
 
     @property
+    def services(self):
+        return self.settings.setdefault('services', {})
+    @property
     def hub(self):
         return self.settings['hub']
 
@@ -144,7 +147,7 @@ class BaseHandler(RequestHandler):
         if orm_token is None:
             return None
         else:
-            return orm_token.user
+            return orm_token.user or orm_token.service
 
     def _user_for_cookie(self, cookie_name, cookie_value=None):
         """Get the User for a given cookie, if there is one"""
@@ -236,6 +239,10 @@ class BaseHandler(RequestHandler):
             **kwargs
         )
 
+    def set_service_cookie(self, user):
+        """set the login cookie for services"""
+        self._set_user_cookie(user, self.service_server)
+
     def set_server_cookie(self, user):
         """set the login cookie for the single-user server"""
         self._set_user_cookie(user, user.server)
@@ -253,6 +260,10 @@ class BaseHandler(RequestHandler):
         # create and set a new cookie token for the single-user server
         if user.server:
             self.set_server_cookie(user)
+
+        # set single cookie for services
+        if self.db.query(orm.Service).first():
+            self.set_service_cookie(user)
 
         # create and set a new cookie token for the hub
         if not self.get_current_user_cookie():
@@ -456,7 +467,11 @@ class PrefixRedirectHandler(BaseHandler):
     Redirects /foo to /prefix/foo, etc.
     """
     def get(self):
-        path = self.request.uri[len(self.base_url):]
+        uri = self.request.uri
+        if uri.startswith(self.base_url):
+            path = self.request.uri[len(self.base_url):]
+        else:
+            path = self.request.path
         self.redirect(url_path_join(
             self.hub.server.base_url, path,
         ), permanent=False)
@@ -467,8 +482,9 @@ class UserSpawnHandler(BaseHandler):
 
     If logged in, spawn a single-user server and redirect request.
     If a user, alice, requests /user/bob/notebooks/mynotebook.ipynb,
-    redirect her to /user/alice/notebooks/mynotebook.ipynb, which should
-    in turn call this function.
+    she will be redirected to /hub/user/bob/notebooks/mynotebook.ipynb,
+    which will be handled by this handler,
+    which will in turn send her to /user/alice/notebooks/mynotebook.ipynb.
     """
 
     @gen.coroutine
@@ -515,6 +531,24 @@ class UserSpawnHandler(BaseHandler):
             ))
 
 
+class UserRedirectHandler(BaseHandler):
+    """Redirect requests to user servers.
+    
+    Allows public linking to "this file on your server".
+    
+    /user-redirect/path/to/foo will redirect to /user/:name/path/to/foo
+    
+    If the user is not logged in, send to login URL, redirecting back here.
+    
+    .. versionadded:: 0.7
+    """
+    @web.authenticated
+    def get(self, path):
+        user = self.get_current_user()
+        url = url_path_join(user.url, path)
+        self.redirect(url)
+
+
 class CSPReportHandler(BaseHandler):
     '''Accepts a content security policy violation report'''
     @web.authenticated
@@ -527,7 +561,9 @@ class CSPReportHandler(BaseHandler):
         # Report it to statsd as well
         self.statsd.incr('csp_report')
 
+
 default_handlers = [
     (r'/user/([^/]+)(/.*)?', UserSpawnHandler),
+    (r'/user-redirect/(.*)?', UserRedirectHandler),
     (r'/security/csp-report', CSPReportHandler),
 ]

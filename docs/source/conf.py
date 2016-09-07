@@ -38,6 +38,14 @@ extensions = [
     'sphinx.ext.napoleon',
 ]
 
+# Spelling
+try:
+    import sphinxcontrib.spelling
+except ImportError:
+    pass
+else:
+    extensions.append("sphinxcontrib.spelling")
+
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
 
@@ -67,7 +75,8 @@ author = u'Project Jupyter team'
 # built documents.
 # Project Jupyter uses the following to autopopulate version
 from os.path import dirname
-root = dirname(dirname(dirname(__file__)))
+docs = dirname(dirname(__file__))
+root = dirname(docs)
 sys.path.insert(0, root)
 
 import jupyterhub
@@ -382,5 +391,11 @@ if not on_rtd:  # only import and set the theme if we're building docs locally
     import sphinx_rtd_theme
     html_theme = 'sphinx_rtd_theme'
     html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
-
+else:
+    # build rest-api, since RTD doesn't run make
+    from subprocess import check_call as sh
+    sh(['make', 'rest-api'], cwd=docs)
 # otherwise, readthedocs.org uses their theme by default, so no need to specify it
+
+# Spell checking using sphinxcontrib-spelling
+spelling_word_list_filename='spelling_wordlist.txt'

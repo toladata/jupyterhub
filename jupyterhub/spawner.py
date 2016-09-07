@@ -7,6 +7,7 @@ import errno
 import os
 import pipes
 import pwd
+import shutil
 import signal
 import sys
 import grp
@@ -45,6 +46,9 @@ class Spawner(LoggingConfigurable):
     ip = Unicode('127.0.0.1',
         help="The IP address (or hostname) the single-user server should listen on"
     ).tag(config=True)
+    port = Integer(0,
+        help="The port for single-user servers to listen on. New in version 0.7."
+    )
     start_timeout = Integer(60,
         help="""Timeout (in seconds) before giving up on the spawner.
         
@@ -244,7 +248,6 @@ class Spawner(LoggingConfigurable):
         """Return the arguments to be passed after self.cmd"""
         args = [
             '--user=%s' % self.user.name,
-            '--port=%i' % self.user.server.port,
             '--cookie-name=%s' % self.user.server.cookie_name,
             '--base-url=%s' % self.user.server.base_url,
             '--hub-host=%s' % self.hub.host,
@@ -253,6 +256,13 @@ class Spawner(LoggingConfigurable):
             ]
         if self.ip:
             args.append('--ip=%s' % self.ip)
+
+        if self.port:
+            args.append('--port=%i' % self.port)
+        elif self.user.server.port:
+            self.log.warning("Setting port from user.server is deprecated as of JupyterHub 0.7.")
+            args.append('--port=%i' % self.user.server.port)
+
         if self.notebook_dir:
             self.notebook_dir = self.notebook_dir.replace("%U",self.user.name)
             args.append('--notebook-dir=%s' % self.notebook_dir)
@@ -269,7 +279,15 @@ class Spawner(LoggingConfigurable):
     
     @gen.coroutine
     def start(self):
-        """Start the single-user process"""
+        """Start the single-user server
+        
+        Returns:
+        
+        (ip, port): the ip, port where the Hub can connect to the server.
+        
+        .. versionchanged:: 0.7
+            Return ip, port instead of setting on self.user.server directly.
+        """
         raise NotImplementedError("Override in subclass. Must be a Tornado gen.coroutine.")
     
     @gen.coroutine
@@ -455,22 +473,30 @@ class LocalProcessSpawner(Spawner):
     @gen.coroutine
     def start(self):
         """Start the process"""
-        if self.ip:
-            self.user.server.ip = self.ip
-        self.user.server.port = random_port()
+        self.port = random_port()
         cmd = []
         env = self.get_env()
-        
+
         cmd.extend(self.cmd)
         cmd.extend(self.get_args())
-        
+
         self.log.info("Spawning %s", ' '.join(pipes.quote(s) for s in cmd))
-        self.proc = Popen(cmd, env=env,
-            preexec_fn=self.make_preexec_fn(self.user.name),
-            start_new_session=True, # don't forward signals
-        )
+        try:
+            self.proc = Popen(cmd, env=env,
+                preexec_fn=self.make_preexec_fn(self.user.name),
+                start_new_session=True, # don't forward signals
+            )
+        except PermissionError:
+            # use which to get abspath
+            script = shutil.which(cmd[0]) or cmd[0]
+            self.log.error("Permission denied trying to run %r. Does %s have access to this file?",
+                script, self.user.name,
+            )
+            raise
+
         self.pid = self.proc.pid
-    
+        return (self.ip or '127.0.0.1', self.port)
+
     @gen.coroutine
     def poll(self):
         """Poll the process"""
@@ -545,4 +571,4 @@ class LocalProcessSpawner(Spawner):
         if status is None:
             # it all failed, zombie process
             self.log.warning("Process %i never died", self.pid)
-    
+
